@@ -59,8 +59,8 @@ Eigen::Vector3d GetVoxelCenter(const openvdb::Coord& voxel, const openvdb::math:
 
 namespace vdbfusion {
 
-VDBVolume::VDBVolume(float voxel_size, float sdf_trunc, bool space_carving /* = false*/)
-    : voxel_size_(voxel_size), sdf_trunc_(sdf_trunc), space_carving_(space_carving) {
+VDBVolume::VDBVolume(float voxel_size, float sdf_trunc)
+    : voxel_size_(voxel_size), sdf_trunc_(sdf_trunc) {
     tsdf_ = openvdb::FloatGrid::create(sdf_trunc_);
     tsdf_->setName("D(x): signed distance grid");
     tsdf_->setTransform(openvdb::math::Transform::createLinearTransform(voxel_size_));
@@ -99,9 +99,33 @@ void VDBVolume::Integrate(openvdb::FloatGrid::Ptr grid,
     }
 }
 
+void VDBVolume::Integrate(std::shared_ptr<vdbfusion::VDBVolume> volume, Eigen::Matrix4d tf) {
+    auto weights_acc = volume->weights_->getConstAccessor();
+
+    float scale = tsdf_->transform().voxelSize()[0];
+    tf(0, 3) = tf(0, 3) / scale;
+    tf(1, 3) = tf(1, 3) / scale;
+    tf(2, 3) = tf(2, 3) / scale;
+
+    for (auto iter = volume->tsdf_->cbeginValueOn(); iter.test(); ++iter) {
+        const auto& sdf = iter.getValue();
+        auto voxel = iter.getCoord();
+
+        Eigen::Vector4d point(voxel.x(), voxel.y(), voxel.z(), 1);
+        point = tf*point;
+
+        openvdb::Coord voxelTf(int(point(0)), int(point(1)), int(point(2)));
+
+        float weight = weights_acc.getValue(voxel);
+
+        this->UpdateTSDF(sdf, voxelTf, [weight](float){return weight;});
+    }
+}
+
 void VDBVolume::Integrate(const std::vector<Eigen::Vector3d>& points,
                           const Eigen::Vector3d& origin,
-                          const std::function<float(float)>& weighting_function) {
+                          const std::function<float(float)>& weighting_function,
+                          const bool space_carving_) {
     if (points.empty()) {
         std::cerr << "PointCloud provided is empty\n";
         return;
@@ -146,6 +170,64 @@ void VDBVolume::Integrate(const std::vector<Eigen::Vector3d>& points,
             }
         } while (dda.step());
     });
+}
+
+void VDBVolume::IntegrateFreeRays(const std::vector<Eigen::Vector3d>& points,
+                          const Eigen::Vector3d& origin,
+                          const float weight) {
+    if (points.empty()) {
+        std::cerr << "PointCloud provided is empty\n";
+        return;
+    }
+
+    const openvdb::Vec3R eye(origin.x(), origin.y(), origin.z());
+
+    // Get the "unsafe" version of the grid acessors
+    auto tsdf_acc = tsdf_->getUnsafeAccessor();
+    auto weights_acc = weights_->getUnsafeAccessor();
+
+    // Launch an for_each execution, use std::execution::par to parallelize this region
+    std::for_each(points.cbegin(), points.cend(), [&](const auto& point) {
+        // Get the direction from the sensor origin to the point and normalize it
+        const Eigen::Vector3d direction = point - origin;
+        openvdb::Vec3R dir(direction.x(), direction.y(), direction.z());
+        dir.normalize();
+        //
+        // Create one DDA per ray(per thread), the ray must operate on voxel grid coordinates.
+        const auto ray = openvdb::math::Ray<float>(eye, dir, 0, sqrt(direction.squaredNorm())).worldToIndex(*tsdf_);
+        openvdb::math::DDA<decltype(ray)> dda(ray);
+        do {
+            const auto voxel = dda.voxel();
+            const float last_weight = weights_acc.getValue(voxel);
+            const float last_tsdf = tsdf_acc.getValue(voxel);
+            const float new_weight = weight + last_weight;
+            const float new_tsdf = (last_tsdf * last_weight + 5*sdf_trunc_ * weight) / (new_weight);
+            tsdf_acc.setValue(voxel, new_tsdf);
+            weights_acc.setValue(voxel, new_weight);
+        } while (dda.step());
+    });
+}
+
+// extract a color point cloud from the TSDF volume (extracts ALL points, a faster live preview but lower quality version below)
+std::vector<Eigen::Vector3d> VDBVolume::ExtractPointCloud(float thresh, float min_weight) const {
+    std::vector<Eigen::Vector3d> points;
+
+    auto weights_acc = weights_->getConstAccessor();
+
+    for (auto iter = tsdf_->cbeginValueOn(); iter.test(); ++iter) {
+        const auto &voxel = iter.getCoord();
+        // get tsdf value and convert tsdf to positive distance
+        const auto &tsdf = iter.getValue();
+        const auto tsdf_abs = std::abs(tsdf);
+        if (tsdf_abs < thresh) {
+            const auto& weight = weights_acc.getValue(voxel);
+            if (weight > min_weight) {
+                const auto point = GetVoxelCenter(voxel, tsdf_->transform());
+                points.push_back(Eigen::Vector3d(point.x(), point.y(), point.z()));
+            }
+        }
+    }
+    return points;
 }
 
 openvdb::FloatGrid::Ptr VDBVolume::Prune(float min_weight) const {
